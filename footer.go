@@ -77,7 +77,7 @@ func parseFooter(data *segment.Data) (*footer, error) {
 		return nil, err
 	}
 	rv.version = binary.BigEndian.Uint32(verData)
-	if rv.version != Version {
+	if rv.version > Version {
 		return nil, fmt.Errorf("unsupported version %d", rv.version)
 	}
 

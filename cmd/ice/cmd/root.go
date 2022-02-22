@@ -110,7 +110,7 @@ func openFromFile(path string) (segment.Segment, closeFunc, error) {
 	seg, err := ice.Load(data)
 	if err != nil {
 		_ = closeF()
-		return nil, noCloseFunc, fmt.Errorf("error loading segment: %v", err)
+		return nil, noCloseFunc, fmt.Errorf("error loading segment %s: %v", path, err)
 	}
 
 	return seg, closeF, nil

@@ -17,6 +17,7 @@ package ice
 import (
 	"bytes"
 	"encoding/binary"
+	"log"
 	"math"
 	"sort"
 	"sync"
@@ -704,7 +705,7 @@ func (s *interim) writeDictsField(docTermMap [][]byte, fieldID int, terms []stri
 	dict := s.Dicts[fieldID]
 
 	for _, term := range terms { // terms are already sorted
-		err2 := s.writeDictsTermField(docTermMap, dict, term, tfEncoder, locEncoder, buf)
+		err2 := s.writeDictsTermField(docTermMap, dict, fieldID, term, tfEncoder, locEncoder, buf)
 		if err2 != nil {
 			return err2
 		}
@@ -779,7 +780,7 @@ func (s *interim) writeDictsField(docTermMap [][]byte, fieldID int, terms []stri
 	return nil
 }
 
-func (s *interim) writeDictsTermField(docTermMap [][]byte, dict map[string]uint64, term string, tfEncoder,
+func (s *interim) writeDictsTermField(docTermMap [][]byte, dict map[string]uint64, fieldID int, term string, tfEncoder,
 	locEncoder *chunkedIntCoder, buf []byte) error {
 	pid := dict[term] - 1
 
@@ -813,9 +814,39 @@ func (s *interim) writeDictsTermField(docTermMap [][]byte, dict map[string]uint6
 
 		if freqNorm.numLocs > 0 {
 			numBytesLocs := 0
+			numFieldBytes := 0
+			var lastEnd uint64
+			var lastPos uint64
+			var locFlags LocFlags
 			for _, loc := range locs[locOffset : locOffset+freqNorm.numLocs] {
-				numBytesLocs += totalUvarintBytes(
-					uint64(loc.fieldID), loc.pos, loc.start, loc.end)
+				if loc.end < loc.start {
+					log.Fatal("backwards!!!\n")
+				}
+				if Version == 1 {
+					numBytesLocs += totalUvarintBytes(
+						uint64(loc.fieldID), loc.pos, loc.start, loc.end)
+				} else {
+					if loc.fieldID != uint16(fieldID) {
+						locFlags |= LocFlagStoredField
+					}
+
+					numBytesLocs += numUvarintBytes((loc.pos - lastPos) << 1)
+					numBytesLocs += numUvarintBytes(loc.start - lastEnd)
+					if uint64(len(term)) != loc.end-loc.start {
+						numBytesLocs += numUvarintBytes(loc.end - loc.start)
+					}
+					numFieldBytes += numUvarintBytes(uint64(loc.fieldID))
+					lastEnd = loc.end
+					lastPos = loc.pos
+				}
+			}
+
+			if Version == 2 {
+				if locFlags&LocFlagStoredField != 0 {
+					numBytesLocs += numFieldBytes
+				}
+
+				numBytesLocs += numUvarintBytes(uint64(locFlags))
 			}
 
 			err = locEncoder.Add(docNum, uint64(numBytesLocs))
@@ -823,9 +854,50 @@ func (s *interim) writeDictsTermField(docTermMap [][]byte, dict map[string]uint6
 				return err
 			}
 
+			if Version == 2 {
+				err = locEncoder.Add(docNum, uint64(locFlags))
+				if err != nil {
+					return err
+				}
+			}
+
+			lastEnd = 0
+			lastPos = 0
 			for _, loc := range locs[locOffset : locOffset+freqNorm.numLocs] {
-				err = locEncoder.Add(docNum,
-					uint64(loc.fieldID), loc.pos, loc.start, loc.end)
+				if loc.start < lastEnd {
+					log.Fatal("loc backwards\n")
+				}
+
+				var endNotStoredFlag uint64
+				if uint64(len(term)) == loc.end-loc.start {
+					endNotStoredFlag = 1
+				}
+
+				if Version == 1 {
+					err = locEncoder.Add(docNum,
+						uint64(loc.fieldID), loc.pos, loc.start, loc.end)
+				} else {
+					posDelta := loc.pos - lastPos
+					if (locFlags & LocFlagStoredField) != 0 {
+						if endNotStoredFlag != 0 {
+							err = locEncoder.Add(docNum,
+								uint64(loc.fieldID), (posDelta<<1)|endNotStoredFlag, loc.start-lastEnd)
+						} else {
+							err = locEncoder.Add(docNum,
+								uint64(loc.fieldID), posDelta<<1, loc.start-lastEnd, loc.end-loc.start)
+						}
+					} else {
+						if endNotStoredFlag != 0 {
+							err = locEncoder.Add(docNum,
+								(posDelta<<1)|endNotStoredFlag, loc.start-lastEnd)
+						} else {
+							err = locEncoder.Add(docNum,
+								posDelta<<1, loc.start-lastEnd, loc.end-loc.start)
+						}
+					}
+				}
+				lastEnd = loc.end
+				lastPos = loc.pos
 				if err != nil {
 					return err
 				}

@@ -20,6 +20,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
 	"sync"
 
 	"github.com/RoaringBitmap/roaring"
@@ -28,7 +30,15 @@ import (
 	"github.com/golang/snappy"
 )
 
-const Version uint32 = 1
+func getVersion() uint32 {
+	v, e := strconv.ParseUint(os.Getenv("ICEV"), 10, 32)
+	if e != nil {
+		return 2
+	}
+	return uint32(v)
+}
+
+var Version uint32 = getVersion()
 
 const Type string = "ice"
 

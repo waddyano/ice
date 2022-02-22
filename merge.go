@@ -281,7 +281,7 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 		}
 
 		if !bytes.Equal(prevTerm, term) || prevTerm == nil {
-			err = prepareNewTerm(newSegDocCount, chunkMode, tfEncoder, locEncoder, fieldFreqs, fieldID, enumerator,
+			err = prepareNewTerm(term, newSegDocCount, chunkMode, tfEncoder, locEncoder, fieldFreqs, fieldID, enumerator,
 				dicts, drops)
 			if err != nil {
 				return err
@@ -289,7 +289,7 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 		}
 
 		postings, err = dicts[itrI].postingsListFromOffset(
-			postingsOffset, drops[itrI], postings)
+			postingsOffset, term, drops[itrI], postings)
 		if err != nil {
 			return err
 		}
@@ -301,7 +301,7 @@ func persistMergedRestField(segments []*Segment, dropsIn []*roaring.Bitmap, fiel
 
 		// can no longer optimize by copying, since chunk factor could have changed
 		lastDocNum, lastFreq, lastNorm, bufLoc, err = mergeTermFreqNormLocs(
-			fieldsMap, postItr, newDocNums[itrI], newRoaring,
+			term, fieldsMap, fieldID, postItr, newDocNums[itrI], newRoaring,
 			tfEncoder, locEncoder, bufLoc, fieldDocTracking)
 
 		if err != nil {
@@ -427,7 +427,7 @@ func buildMergedDocVals(newSegDocCount uint64, w *countHashWriter, closeCh chan 
 	return nil
 }
 
-func prepareNewTerm(newSegDocCount uint64, chunkMode uint32, tfEncoder, locEncoder *chunkedIntCoder,
+func prepareNewTerm(term []byte, newSegDocCount uint64, chunkMode uint32, tfEncoder, locEncoder *chunkedIntCoder,
 	fieldFreqs map[uint16]uint64, fieldID int, enumerator *enumerator, dicts []*Dictionary,
 	drops []*roaring.Bitmap) error {
 	var err error
@@ -437,7 +437,7 @@ func prepareNewTerm(newSegDocCount uint64, chunkMode uint32, tfEncoder, locEncod
 	lowItrIdxs, lowItrVals := enumerator.GetLowIdxsAndValues()
 	for i, idx := range lowItrIdxs {
 		var pl *PostingsList
-		pl, err = dicts[idx].postingsListFromOffset(lowItrVals[i], drops[idx], nil)
+		pl, err = dicts[idx].postingsListFromOffset(lowItrVals[i], term, drops[idx], nil)
 		if err != nil {
 			return err
 		}
@@ -556,7 +556,7 @@ func setupActiveForField(segments []*Segment, dropsIn []*roaring.Bitmap, newDocN
 
 const numUintsLocation = 4
 
-func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterator,
+func mergeTermFreqNormLocs(term []byte, fieldsMap map[string]uint16, fieldID int, postItr *PostingsIterator,
 	newDocNums []uint64, newRoaring *roaring.Bitmap,
 	tfEncoder, locEncoder *chunkedIntCoder, bufLoc []uint64, docTracking *roaring.Bitmap) (
 	lastDocNum, lastFreq, lastNorm uint64, bufLocOut []uint64, err error) {
@@ -583,9 +583,36 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterato
 
 		if len(locs) > 0 {
 			numBytesLocs := 0
+			numFieldBytes := 0
+			var locFlags LocFlags
+			var lastEnd uint64
+			var lastPos uint64
 			for _, loc := range locs {
-				numBytesLocs += totalUvarintBytes(uint64(fieldsMap[loc.Field()]-1),
-					uint64(loc.Pos()), uint64(loc.Start()), uint64(loc.End()))
+				locFieldID := fieldsMap[loc.Field()] - 1
+				if Version == 1 {
+					numBytesLocs += totalUvarintBytes(uint64(locFieldID),
+						uint64(loc.Pos()), uint64(loc.Start()), uint64(loc.End()))
+				} else {
+					if locFieldID != uint16(fieldID) {
+						locFlags |= LocFlagStoredField
+					}
+					numBytesLocs += numUvarintBytes((uint64(loc.Pos()) - lastPos) << 1)
+					numBytesLocs += numUvarintBytes(uint64(loc.Start()) - lastEnd)
+					if len(term) != loc.End()-loc.Start() {
+						numBytesLocs += numUvarintBytes(uint64(loc.End() - loc.Start()))
+					}
+					numFieldBytes += numUvarintBytes(uint64(locFieldID))
+					lastEnd = uint64(loc.End())
+					lastPos = uint64(loc.Pos())
+				}
+			}
+
+			if Version == 2 {
+				if locFlags&LocFlagStoredField != 0 {
+					numBytesLocs += numFieldBytes
+				}
+
+				numBytesLocs += numUvarintBytes(uint64(locFlags))
 			}
 
 			err = locEncoder.Add(hitNewDocNum, uint64(numBytesLocs))
@@ -593,15 +620,59 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, postItr *PostingsIterato
 				return 0, 0, 0, nil, err
 			}
 
+			if Version == 2 {
+				err = locEncoder.Add(hitNewDocNum, uint64(locFlags))
+				if err != nil {
+					return 0, 0, 0, nil, err
+				}
+			}
+
+			lastEnd = 0
+			lastPos = 0
 			for _, loc := range locs {
 				if cap(bufLoc) < numUintsLocation {
 					bufLoc = make([]uint64, 0, numUintsLocation)
 				}
-				args := bufLoc[0:4]
-				args[0] = uint64(fieldsMap[loc.Field()] - 1)
-				args[1] = uint64(loc.Pos())
-				args[2] = uint64(loc.Start())
-				args[3] = uint64(loc.End())
+				var args []uint64
+				if Version == 2 {
+					var endNotStoredFlag uint64
+					if len(term) == loc.End()-loc.Start() {
+						endNotStoredFlag = 1
+					}
+					if (locFlags & LocFlagStoredField) == 0 {
+						if endNotStoredFlag != 0 {
+							args = bufLoc[0:2]
+							args[0] = (uint64(loc.Pos())-lastPos)<<1 | endNotStoredFlag
+							args[1] = uint64(loc.Start()) - lastEnd
+						} else {
+							args = bufLoc[0:3]
+							args[0] = (uint64(loc.Pos()) - lastPos) << 1
+							args[1] = uint64(loc.Start()) - lastEnd
+							args[2] = uint64(loc.End() - loc.Start())
+						}
+					} else {
+						if endNotStoredFlag != 0 {
+							args = bufLoc[0:3]
+							args[0] = uint64(fieldsMap[loc.Field()] - 1)
+							args[1] = (uint64(loc.Pos())-lastPos)<<1 | endNotStoredFlag
+							args[2] = uint64(loc.Start()) - lastEnd
+						} else {
+							args = bufLoc[0:4]
+							args[0] = uint64(fieldsMap[loc.Field()] - 1)
+							args[1] = (uint64(loc.Pos()) - lastPos) << 1
+							args[2] = uint64(loc.Start()) - lastEnd
+							args[3] = uint64(loc.End() - loc.Start())
+						}
+					}
+					lastEnd = uint64(loc.End())
+					lastPos = uint64(loc.Pos())
+				} else {
+					args = bufLoc[0:4]
+					args[0] = uint64(fieldsMap[loc.Field()] - 1)
+					args[1] = uint64(loc.Pos())
+					args[2] = uint64(loc.Start())
+					args[3] = uint64(loc.End())
+				}
 				err = locEncoder.Add(hitNewDocNum, args...)
 				if err != nil {
 					return 0, 0, 0, nil, err

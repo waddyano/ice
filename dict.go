@@ -50,7 +50,7 @@ func (d *Dictionary) postingsList(term []byte, except *roaring.Bitmap, rv *Posti
 		if rv == nil || rv == emptyPostingsList {
 			return emptyPostingsList, nil
 		}
-		return d.postingsListInit(rv, except), nil
+		return d.postingsListInit(rv, term, except), nil
 	}
 
 	postingsOffset, exists, err := d.fstReader.Get(term)
@@ -61,14 +61,14 @@ func (d *Dictionary) postingsList(term []byte, except *roaring.Bitmap, rv *Posti
 		if rv == nil || rv == emptyPostingsList {
 			return emptyPostingsList, nil
 		}
-		return d.postingsListInit(rv, except), nil
+		return d.postingsListInit(rv, term, except), nil
 	}
 
-	return d.postingsListFromOffset(postingsOffset, except, rv)
+	return d.postingsListFromOffset(postingsOffset, term, except, rv)
 }
 
-func (d *Dictionary) postingsListFromOffset(postingsOffset uint64, except *roaring.Bitmap, rv *PostingsList) (*PostingsList, error) {
-	rv = d.postingsListInit(rv, except)
+func (d *Dictionary) postingsListFromOffset(postingsOffset uint64, term []byte, except *roaring.Bitmap, rv *PostingsList) (*PostingsList, error) {
+	rv = d.postingsListInit(rv, term, except)
 
 	err := rv.read(postingsOffset, d)
 	if err != nil {
@@ -78,7 +78,7 @@ func (d *Dictionary) postingsListFromOffset(postingsOffset uint64, except *roari
 	return rv, nil
 }
 
-func (d *Dictionary) postingsListInit(rv *PostingsList, except *roaring.Bitmap) *PostingsList {
+func (d *Dictionary) postingsListInit(rv *PostingsList, term []byte, except *roaring.Bitmap) *PostingsList {
 	if rv == nil || rv == emptyPostingsList {
 		rv = &PostingsList{}
 	} else {
@@ -92,6 +92,8 @@ func (d *Dictionary) postingsListInit(rv *PostingsList, except *roaring.Bitmap) 
 		rv.postings = postings
 	}
 	rv.sb = d.sb
+	rv.dict = d
+	rv.term = term
 	rv.except = except
 	return rv
 }

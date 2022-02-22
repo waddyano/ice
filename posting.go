@@ -23,6 +23,12 @@ import (
 	segment "github.com/blugelabs/bluge_segment_api"
 )
 
+type LocFlags uint8
+
+const (
+	LocFlagStoredField LocFlags = 1 << iota
+)
+
 // FST or vellum value (uint64) encoding is determined by the top two
 // highest-order or most significant bits...
 //
@@ -78,11 +84,14 @@ const docNum1HitFinished = math.MaxUint64
 // PostingsList is an in-memory representation of a postings list
 type PostingsList struct {
 	sb             *Segment
+	dict           *Dictionary
 	postingsOffset uint64
 	freqOffset     uint64
 	locOffset      uint64
 	postings       *roaring.Bitmap
 	except         *roaring.Bitmap
+
+	term []byte
 
 	// when normBits1Hit != 0, then this postings list came from a
 	// 1-hit encoding, and only the docNum1Hit & normBits1Hit apply
@@ -410,32 +419,67 @@ func decodeFreqHasLocs(freqHasLocs uint64) (int, bool) {
 
 // readLocation processes all the integers on the stream representing a single
 // location.
-func (i *PostingsIterator) readLocation(l *Location) error {
+func (i *PostingsIterator) readLocation(l *Location, locFlags LocFlags, lastEnd uint64, lastPos uint64) error {
 	// read off field
-	fieldID, err := i.locReader.readUvarint()
-	if err != nil {
-		return fmt.Errorf("error reading location field: %v", err)
+	var savedFieldId uint64
+	version := i.postings.sb.Version()
+	if version == 1 || (locFlags&LocFlagStoredField) != 0 {
+		var err error
+		savedFieldId, err = i.locReader.readUvarint()
+		if err != nil {
+			return fmt.Errorf("error reading location field: %v", err)
+		}
 	}
+
 	// read off pos
 	pos, err := i.locReader.readUvarint()
 	if err != nil {
 		return fmt.Errorf("error reading location pos: %v", err)
 	}
+
+	pos += lastPos
+
+	endNotStored := false
+	if version == 2 {
+		if (pos & 1) != 0 {
+			endNotStored = true
+		}
+		pos >>= 1
+	}
+
 	// read off start
 	start, err := i.locReader.readUvarint()
 	if err != nil {
 		return fmt.Errorf("error reading location start: %v", err)
 	}
+
 	// read off end
-	end, err := i.locReader.readUvarint()
-	if err != nil {
-		return fmt.Errorf("error reading location end: %v", err)
+	var end uint64
+	if !endNotStored {
+		var err error
+		end, err = i.locReader.readUvarint()
+		if err != nil {
+			return fmt.Errorf("error reading location end: %v", err)
+		}
 	}
 
-	l.field = i.postings.sb.fieldsInv[fieldID]
+	if version == 1 || (locFlags&LocFlagStoredField) != 0 {
+		l.field = i.postings.sb.fieldsInv[savedFieldId]
+	} else {
+		l.field = i.postings.sb.fieldsInv[i.postings.dict.fieldID]
+	}
 	l.pos = int(pos)
 	l.start = int(start)
-	l.end = int(end)
+	if version == 2 {
+		l.start = int(start + lastEnd)
+		if endNotStored {
+			l.end = l.start + len(i.postings.term)
+		} else {
+			l.end = int(end)
+		}
+	} else {
+		l.end = int(end)
+	}
 
 	return nil
 }
@@ -498,14 +542,28 @@ func (i *PostingsIterator) nextAtOrAfter(atOrAfter uint64) (segment.Posting, err
 			return nil, fmt.Errorf("error reading location numLocsBytes: %v", err)
 		}
 
+		var locFlags LocFlags
+		if i.postings.sb.Version() == 2 {
+			locFlags64, err := i.locReader.readUvarint()
+			if err != nil {
+				return nil, fmt.Errorf("error reading location locFlags: %v", err)
+			}
+			locFlags = LocFlags(locFlags64)
+			numLocsBytes -= uint64(numUvarintBytes(locFlags64))
+		}
+
 		j := 0
 		startBytesRemaining := i.locReader.Len() // # bytes remaining in the locReader
+		var lastEnd uint64
+		var lastPos uint64
 		for startBytesRemaining-i.locReader.Len() < int(numLocsBytes) {
-			err := i.readLocation(&i.nextLocs[j])
+			err := i.readLocation(&i.nextLocs[j], locFlags, lastEnd, lastPos)
 			if err != nil {
 				return nil, err
 			}
 			rv.locs = append(rv.locs, &i.nextLocs[j])
+			lastEnd = uint64(i.nextLocs[j].end)
+			lastPos = uint64(i.nextLocs[j].pos)
 			j++
 		}
 	}
